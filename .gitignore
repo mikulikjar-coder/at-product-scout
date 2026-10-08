@@ -1,0 +1,6 @@
+﻿venv/
+.venv/
+__pycache__/
+.env
+node_modules/
+at-scout-mobile/node_modules/

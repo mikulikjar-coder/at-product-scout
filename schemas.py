@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal, Optional
 from urllib.parse import quote_plus
 
@@ -35,6 +36,47 @@ Liquidity = Literal[
 ]
 
 GEIZHALS_SEARCH = "https://geizhals.at/?fs={query}"
+IDEALO_SEARCH = (
+    "https://www.idealo.at/preisvergleich/MainSearchProductCategory.html?q={query}"
+)
+WILLHABEN_SEARCH = (
+    "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz?keyword={query}"
+)
+
+BANNED_PRIVATE_BRANDS: tuple[str, ...] = (
+    "silvercrest",
+    "parkside",
+    "ambiano",
+    "quigg",
+    "crivit",
+    "livarno",
+    "ernesto",
+    "auriol",
+    "workzone",
+    "casalux",
+    "ciao",
+)
+
+_SEARCH_NOISE = {
+    "kaffeevollautomat",
+    "espressomaschine",
+    "kaffeemaschine",
+    "siebtragermaschine",
+    "siebtraegermaschine",
+    "siebträgermaschine",
+    "kávovar",
+    "kavovar",
+    "automat",
+    "automatický",
+    "edelstahl",
+    "nerez",
+    "schwarz",
+    "weiß",
+    "weiss",
+    "white",
+    "black",
+    "silber",
+}
 
 # Fráze, které supervizor musí přepsat na měřitelné parametry.
 BANNED_PHRASES: tuple[str, ...] = (
@@ -87,9 +129,36 @@ def find_price_fillers(*texts: str) -> list[str]:
     return sorted(phrase for phrase in PRICE_FILLERS if phrase in haystack)
 
 
+def clean_search_query(original_title: str) -> str:
+    """Nechá výrobce a model, zahodí marketingový přívlastky a rozbité znaky."""
+    text = original_title.replace("\u00a0", " ")
+    text = re.sub(r'[«»“”"„]', "", text)
+    text = re.sub(r"[|/]+", " ", text)
+    text = re.sub(r"[^\w.+'\- ]+", " ", text, flags=re.UNICODE)
+    tokens = [token for token in text.split() if token]
+    kept = [token for token in tokens if token.lower().strip(".,") not in _SEARCH_NOISE]
+    return " ".join(kept or tokens)
+
+
+def marketplace_urls(original_title: str) -> dict[str, str]:
+    """Přímé vyhledávání na Geizhals, Idealo a Willhaben podle vyčištěného názvu."""
+    query = quote_plus(clean_search_query(original_title))
+    return {
+        "url": GEIZHALS_SEARCH.format(query=query),
+        "idealo_url": IDEALO_SEARCH.format(query=query),
+        "willhaben_url": WILLHABEN_SEARCH.format(query=query),
+    }
+
+
 def geizhals_search_url(original_title: str) -> str:
-    """Vyhledávání na Geizhals.at. Produktový slug se nepoužívá, končí 404."""
-    return GEIZHALS_SEARCH.format(query=quote_plus(" ".join(original_title.split())))
+    """Zpětná kompatibilita: hlavní odkaz vede na Geizhals.at."""
+    return marketplace_urls(original_title)["url"]
+
+
+def find_banned_brands(*texts: str) -> list[str]:
+    """Najde privátní značky diskontů, které do verdiktu nepatří."""
+    haystack = " ".join(text for text in texts if text).lower()
+    return sorted(brand for brand in BANNED_PRIVATE_BRANDS if brand in haystack)
 
 
 def find_cliches(*texts: str) -> list[str]:
@@ -164,7 +233,7 @@ class BudgetScanResult(BaseModel):
     candidates: list[CandidateIdea] = Field(
         min_length=2,
         max_length=4,
-        description="Nejlevnější ještě funkční modely včetně privátních značek.",
+        description="Nejlevnější ještě funkční modely zavedených značek s distribucí na Geizhals.at.",
     )
 
 
@@ -190,7 +259,7 @@ class ResaleRule(BaseModel):
     """Jedno pravidlo bazarové hodnoty pro skupinu značek."""
 
     brand_tier: str = Field(
-        description="Skupina značek, například 'privátní značky Lidl/Hofer' nebo 'De'Longhi'."
+        description="Skupina zavedených značek, například vstupní řada DeLonghi nebo Philips."
     )
     residual_share_percent: float = Field(
         gt=0,
@@ -273,10 +342,23 @@ class EvaluatedItem(BaseModel):
     )
     url: str = Field(
         description=(
-            "Vyhledávací odkaz na Geizhals.at ve formátu "
-            "https://geizhals.at/?fs= plus URL-encoded original_title. "
-            "Nikdy přímá adresa produktové karty."
+            "Vyhledávací odkaz na Geizhals.at: https://geizhals.at/?fs= "
+            "plus vyčištěný a URL-encoded original_title. Nikdy produktový slug."
         )
+    )
+    idealo_url: str = Field(
+        default="",
+        description=(
+            "Vyhledávací odkaz na Idealo.at: "
+            "https://www.idealo.at/preisvergleich/MainSearchProductCategory.html?q="
+        ),
+    )
+    willhaben_url: str = Field(
+        default="",
+        description=(
+            "Vyhledávací odkaz na Willhaben.at: "
+            "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz?keyword="
+        ),
     )
 
     @model_validator(mode="after")
@@ -302,7 +384,10 @@ class EvaluatedItem(BaseModel):
         self.cons = cons
         self.estimated_price_eur = round(float(self.estimated_price_eur), 2)
         self.willhaben_used_price_eur = round(float(self.willhaben_used_price_eur), 2)
-        self.url = geizhals_search_url(title)
+        links = marketplace_urls(title)
+        self.url = links["url"]
+        self.idealo_url = links["idealo_url"]
+        self.willhaben_url = links["willhaben_url"]
         return self
 
 

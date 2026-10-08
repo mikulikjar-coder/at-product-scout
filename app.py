@@ -32,6 +32,7 @@ from schemas import (
     MarketScanResult,
     ResaleScanResult,
     ScoutRequest,
+    find_banned_brands,
     find_cliches,
     find_price_fillers,
 )
@@ -51,37 +52,94 @@ VERDICT_LIMIT = 600
 # Pod 85 % ceny z fáze 1 už nejde o zpřesnění, ale o ohnutí odhadu.
 PRICE_TOLERANCE = 0.85
 
+_FULL_AUTO_QUERY = (
+    "kávovar do kancelář",
+    "kavovar do kancelar",
+    "espresso automat",
+    "kaffeevollautomat",
+    "plně automat",
+    "plne automat",
+    "vollautomat",
+)
+_OFFICE_HINTS = ("kancelář", "kancelar", "büro", "buero", "office")
+_COFFEE_HINTS = ("kávovar", "kavovar", "kaffee", "espresso")
+_FORBIDDEN_WHEN_FULL_AUTO = (
+    "pákov",
+    "pakov",
+    "siebträger",
+    "siebtrager",
+    "portafilter",
+    "kapsle",
+    "kapsel",
+    "nespresso",
+    "dolce gusto",
+    "tassimo",
+    "dedica",
+    "stilosa",
+)
+
+
+def requires_full_auto(query: str) -> bool:
+    """Kancelářský kávovar a espresso automat musí být Kaffeevollautomat s mlýnkem."""
+    lowered = query.lower()
+    if any(hint in lowered for hint in _FULL_AUTO_QUERY):
+        return True
+    coffee = any(hint in lowered for hint in _COFFEE_HINTS)
+    office = any(hint in lowered for hint in _OFFICE_HINTS)
+    return coffee and office
+
 client = AsyncOpenAI(api_key=_API_KEY, timeout=90.0)
 
 _TModel = TypeVar("_TModel", bound=BaseModel)
 
 _BANNED_LIST = ", ".join(BANNED_PHRASES)
 
+MASTER_SYSTEM_PROMPT = """
+Jsi "AT Product Scout Core Engine" – nekompromisní rakouský nákupní analytik
+pro rakouský trh (Geizhals.at, Idealo.at, Willhaben.at).
+
+Pravidla:
+- Kategorická přesnost: Pokud uživatel hledá "kávovar do kanceláře" nebo
+  "espresso automat", MUSÍ to být Kaffeevollautomat s mlýnkem, NIKDY pákový
+  kávovar ani kapsle.
+- Zákaz privátních značek diskontů: NIKDY nedoporučuj Silvercrest, Parkside
+  ani jiné privátní značky, které nejsou běžně na Geizhals.at. Používej pouze
+  zavedené značky s plnou distribucí v Rakousku.
+- Žádná marketingová klišé: Uveď přesné technické parametry a konkrétní
+  kompromisy.
+- Reálné odhady Willhaben cen a likvidity pro Rakousko.
+""".strip()
+
 _SHARED_RULES = f"""
+{MASTER_SYSTEM_PROMPT}
+
 Pevná pravidla pro celou pipeline:
 - Nevymýšlej značky, modelové řady ani katalogová čísla. U nejisté varianty
   uveď oficiální název řady, který jde dohledat na Geizhals.at.
 - Pracuj jen s produkty reálně dostupnými v Rakousku
-  (Geizhals.at, Idealo.at, Amazon.de s doručením do Rakouska, Lidl, Hofer, MediaMarkt).
+  (Geizhals.at, Idealo.at, Amazon.de s doručením do Rakouska, MediaMarkt, Saturn).
 - Ceny uváděj v EUR podle rakouské hladiny, včetně typického dopravného.
 - Zakázané marketingové fráze: {_BANNED_LIST}.
   Každé tvrzení musí nést parametr, číslo nebo konkrétní chybějící funkci.
 - Odrážka výhod nikdy neopakuje cenu ani slovo EUR. Cena má vlastní pole,
   do výhod patří watty, bary, pascaly, litry, decibely, výdrž nebo výbava.
+- Odkazy nesestavuj ručně. Pole url, idealo_url a willhaben_url přepíše kód
+  na vyhledávání podle vyčištěného názvu modelu.
 """.strip()
 
 _BUDGET_AGENT_PROMPT = f"""
-Jsi sub-agent 1 pipeline AT Product Scout: ROZPOČTÁŘ A DISKONTNÍ HLÍDAČ.
+Jsi sub-agent 1 pipeline AT Product Scout: ROZPOČTÁŘ.
 
-Hledáš cenové dno, kde produkt ještě spolehlivě funguje. Znáš diskontní
-a privátní značky reálně prodávané v Rakousku: Cecotec, Silvercrest a Parkside
-(Lidl), Ambiano a Quigg (Hofer), Tchibo, Clatronic, Medion, Severin
-a nejnižší funkční řady zavedených výrobců.
+Hledáš cenové dno, kde produkt ještě spolehlivě funguje. Používej jen zavedené
+značky s plnou distribucí na Geizhals.at, například vstupní řady DeLonghi,
+Philips, Melitta, Krups, Saeco, Jura, Bosch, Siemens, Miele, Sage, Severin
+nebo Cecotec. Zakázané jsou Silvercrest, Parkside, Ambiano, Quigg a další
+privátní značky Lidl/Hofer.
 
 Tvoje práce:
-- strategy_note: kde v Rakousku leží cenové dno kategorie a čím je dané.
-- candidates: nejlevnější modely, které ještě zvládnou hlavní úkol.
-  U každého jeden měřitelný parametr a jedna konkrétní slabina.
+- strategy_note: kde v Rakousku leží cenové dno kategorie u zavedených značek.
+- candidates: nejlevnější modely zavedených značek, které ještě zvládnou
+  hlavní úkol. U každého jeden měřitelný parametr a jedna konkrétní slabina.
 
 {_SHARED_RULES}
 """.strip()
@@ -102,10 +160,10 @@ _RESALE_AGENT_PROMPT = f"""
 Jsi sub-agent 3 pipeline AT Product Scout: BAZAROVÝ ANALYTIK WILLHABEN.AT,
 největšího rakouského inzertního trhu.
 
-Neřeš jednotlivé modely, ale pravidla zůstatkové hodnoty pro skupiny značek
-v této kategorii: kolik procent nové ceny zbyde po roce a jak rychle se kus prodá.
-Zohledni dostupnost náhradních dílů, servis v Rakousku a reálnou poptávku.
-Privátní značky diskontů drží hodnotu výrazně hůř než zavedení výrobci.
+Neřeš jednotlivé modely, ale pravidla zůstatkové hodnoty pro skupiny
+zavedených značek v této kategorii: kolik procent nové ceny zbyde po roce
+a jak rychle se kus prodá. Zohledni dostupnost náhradních dílů, servis
+v Rakousku a reálnou poptávku na Willhaben.at.
 
 {_SHARED_RULES}
 """.strip()
@@ -117,18 +175,23 @@ před odesláním dat do mobilní aplikace.
 
 Sestav přesně tři karty a každou proveď tímto kontrolním seznamem:
 1. ROZPOČET: karta NEJLEVNĚJŠÍ FUNKČNÍ VOLBA nesmí překročit zadaný strop.
-   Pokud podklady strop překračují, vyber skutečně dostupný low-cost model,
-   který se pod strop vejde, klidně od privátní značky diskontu.
-   Ceny přebíráš z podkladů sub-agentů a nikdy je nesnižuješ, aby se model
-   do stropu vešel. Když pod strop nevejde žádný reálný model, nech nejlevnější
-   skutečně dostupný kus a do supervisor_verdict napiš, že strop nelze dodržet.
-2. ŽÁDNÁ KLIŠÉ: zakázané fráze: {_BANNED_LIST}.
+   Pokud podklady strop překračují, vyber skutečně dostupný low-cost model
+   zavedené značky, který se pod strop vejde. Nikdy Silvercrest, Parkside
+   ani jinou privátní značku diskontu. Ceny přebíráš z podkladů sub-agentů
+   a nikdy je nesnižuješ, aby se model do stropu vešel. Když pod strop
+   nevejde žádný reálný model zavedené značky, nech nejlevnější dostupný
+   kus a do supervisor_verdict napiš, že strop nelze dodržet.
+2. KATEGORIE: kávovar do kanceláře nebo espresso automat = jen
+   Kaffeevollautomat s integrovaným mlýnkem. Pákový kávovar a kapsle jsou
+   v tomhle úkolu zakázané.
+3. ŽÁDNÁ KLIŠÉ: zakázané fráze: {_BANNED_LIST}.
    Každá ze tří výhod nese měřitelný parametr, každý ze dvou kompromisů
    pojmenuje chybějící funkci, provozní náklad nebo úsporu na materiálu.
-3. CENOVÁ LOGIKA: willhaben_used_price_eur musí být nižší než estimated_price_eur
+4. CENOVÁ LOGIKA: willhaben_used_price_eur musí být nižší než estimated_price_eur
    a musí odpovídat pravidlům bazarového analytika i zvolené likviditě.
-4. ODKAZY: url je vždy https://geizhals.at/?fs= plus URL-encoded original_title.
-5. POŘADÍ: NEJLEVNĚJŠÍ FUNKČNÍ VOLBA, pak NEJLEPŠÍ CENA / VÝKON,
+5. ODKAZY: kód je přepíše na vyhledávání Geizhals, Idealo a Willhaben
+   podle vyčištěného original_title.
+6. POŘADÍ: NEJLEVNĚJŠÍ FUNKČNÍ VOLBA, pak NEJLEPŠÍ CENA / VÝKON,
    pak MODERNÍ TREND / INOVACE.
 
 Do supervisor_verdict napiš jednu věcnou větu do 25 slov: zda rozpočet drží
@@ -140,7 +203,7 @@ a že vybrané modely jsou dostupné na rakouském trhu. Žádné superlativy.
 _PRIORITY_HINTS: dict[str, str] = {
     "cheapest_possible": (
         "Uživatel chce maximální úsporu. U nejlevnější karty jdi na dno sortimentu "
-        "včetně privátních značek diskontů a u karty cena/výkon nepřeplácej jméno."
+        "zavedených značek na Geizhals.at. Privátní značky diskontů jsou zakázané."
     ),
     "balanced": (
         "Uživatel chce vyvážený výběr. Nejlevnější karta musí být ještě použitelná, "
@@ -215,6 +278,7 @@ async def _parse_structured(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 messages=[
+                    {"role": "system", "content": MASTER_SYSTEM_PROMPT},
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
@@ -322,6 +386,23 @@ def audit_report(
         )
 
     for item in report.items:
+        banned = find_banned_brands(item.name_cz, item.original_title)
+        if banned:
+            problems.append(
+                f"Karta '{item.name_cz}' obsahuje zakázanou privátní značku "
+                f"({', '.join(banned)}). Nahraď ji zavedenou značkou z Geizhals.at."
+            )
+        if requires_full_auto(request.query):
+            haystack = " ".join(
+                (item.name_cz, item.original_title, item.verdict_target, *item.pros, *item.cons)
+            ).lower()
+            mismatches = [hint for hint in _FORBIDDEN_WHEN_FULL_AUTO if hint in haystack]
+            if mismatches:
+                problems.append(
+                    f"Karta '{item.name_cz}' není Kaffeevollautomat s mlýnkem "
+                    f"({', '.join(mismatches)}). Pro tento dotaz je pákový kávovar "
+                    "i kapsle zakázané."
+                )
         cliches = find_cliches(item.name_cz, item.verdict_target, *item.pros, *item.cons)
         if cliches:
             problems.append(
