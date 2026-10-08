@@ -14,9 +14,12 @@ from schemas import (
     clean_search_query,
     find_cliches,
     find_price_fillers,
-    geizhals_search_url,
     marketplace_urls,
 )
+from web_search import MarketEvidence, WebHit, canonical_url, extract_prices, is_tracker_url
+
+
+OFFER_URL = "https://www.mediamarkt.at/de/product/delonghi-ec-685-123456"
 
 
 def card(badge, name, new_price, used_price, pros=None, cons=None):
@@ -30,7 +33,9 @@ def card(badge, name, new_price, used_price, pros=None, cons=None):
         verdict_target="Pro kancelář do pěti lidí.",
         willhaben_used_price_eur=used_price,
         willhaben_liquidity="Střední poptávka",
-        url="https://example.com/produkt-404",
+        offer_origin="Lokální rakouský e-shop",
+        ship_from_country="  Rakousko  ",
+        url=OFFER_URL,
     )
 
 
@@ -51,17 +56,46 @@ except Exception:
     pass
 print("SCOUT_REQUEST_OK")
 
-# 3. URL se vždy přepíše na vyhledávání Geizhals, Idealo i Willhaben.
+# 3. Přímá nabídka zůstane, bazar Willhaben se doplní, vyhledávač se odmítne.
 item = card("NEJLEVNĚJŠÍ FUNKČNÍ VOLBA", "Kávovar De'Longhi EC 685", 199.0, 120.0)
 links = marketplace_urls("De'Longhi EC 685")
-assert item.url == geizhals_search_url("De'Longhi EC 685") == links["url"], item.url
-assert item.url.startswith("https://geizhals.at/?fs="), item.url
+assert item.url == OFFER_URL, item.url
+assert item.offer_origin == "Lokální rakouský e-shop"
+assert item.ship_from_country == "Rakousko"
+assert "geizhals.at/?fs=" not in item.url
 assert item.idealo_url.startswith("https://www.idealo.at/"), item.idealo_url
+assert item.willhaben_url == links["willhaben_url"]
 assert item.willhaben_url.startswith("https://www.willhaben.at/"), item.willhaben_url
-assert "404" not in item.url
 assert clean_search_query('De\'Longhi Magnifica S "Kaffeevollautomat" Edelstahl') == (
     "De'Longhi Magnifica S"
 )
+assert is_tracker_url("https://www.bing.com/aclick?ld=abc")
+assert not is_tracker_url(OFFER_URL)
+for bad_url in (
+    "https://geizhals.at/?fs=kavovar",
+    "https://www.google.com/search?q=kavovar",
+    "https://example.com/produkt",
+    "https://www.bing.com/aclick?ld=abc",
+):
+    try:
+        EvaluatedItem(
+            badge="NEJLEVNĚJŠÍ FUNKČNÍ VOLBA",
+            name_cz="Kávovar DeLonghi Magnifica",
+            original_title="DeLonghi Magnifica",
+            estimated_price_eur=199.0,
+            pros=["15 barů tlaku", "nádrž 1,8 l", "příkon 1350 W"],
+            cons=["plastové tělo", "hlučnost 78 dB"],
+            verdict_target="Pro kancelář do pěti lidí.",
+            willhaben_used_price_eur=120.0,
+            willhaben_liquidity="Střední poptávka",
+            offer_origin="EU sklad",
+            ship_from_country="Německo",
+            url=bad_url,
+        )
+    except Exception as exc:
+        assert "url" in str(exc).lower(), exc
+    else:
+        raise AssertionError(f"URL {bad_url} měla selhat")
 print("URL_NORMALIZACE_OK", item.url)
 
 # 4. Pořadí karet se srovná bez ohledu na vstup.
@@ -195,5 +229,50 @@ assert "jen opakují cenu" in filler_problems[0], filler_problems
 # Kompromis smí cenu zmínit, vyšší cena je legitimní nevýhoda.
 assert audit_report(report, clean_request) == []
 print("DETEKTOR_CENOVE_VATY_OK")
+
+# 11. Živý úryvek drží cenu a URL musí pocházet z nalezených odkazů.
+assert extract_prices("heute 1.299,00 € statt 1.499,00 EUR") == [1299.0, 1499.0]
+assert extract_prices("EUR 249.90 im Shop") == [249.9]
+assert canonical_url("https://www.Shop.AT/p/1/?utm_source=newsletter") == "https://shop.at/p/1"
+evidence = MarketEvidence(
+    hits=[
+        WebHit(
+            title="DeLonghi Magnifica S",
+            url=OFFER_URL,
+            snippet="249,00 €",
+            prices_eur=[249.0],
+        )
+    ]
+)
+missing = report.model_copy(deep=True)
+missing.items[0].url = "https://www.alternate.de/html/product/delonghi-1"
+live_problems = audit_report(missing, ScoutRequest(query="kávovar"), evidence=evidence)
+assert any("není mezi živě nalezenými odkazy" in problem for problem in live_problems), live_problems
+only_first = report.model_copy(deep=True)
+only_first.items[0].estimated_price_eur = 249.0
+only_first.items[1].url = "https://www.amazon.de/dp/B0TESTVALUE01"
+only_first.items[2].url = "https://www.jura.com/de/product/e8-123"
+broad = MarketEvidence(
+    hits=[
+        WebHit(title="MediaMarkt", url=OFFER_URL, snippet="249,00 €", prices_eur=[249.0]),
+        WebHit(
+            title="Amazon",
+            url="https://www.amazon.de/dp/B0TESTVALUE01",
+            snippet="329,00 €",
+            prices_eur=[329.0],
+        ),
+        WebHit(
+            title="Jura",
+            url="https://www.jura.com/de/product/e8-123",
+            snippet="599,00 €",
+            prices_eur=[599.0],
+        ),
+    ]
+)
+assert audit_report(only_first, ScoutRequest(query="kávovar"), evidence=broad) == []
+only_first.items[0].estimated_price_eur = 89.0
+drift = " | ".join(audit_report(only_first, ScoutRequest(query="kávovar"), evidence=broad))
+assert "živý úryvek" in drift, drift
+print("ZIVE_PODKLADY_OK")
 
 print("\nALL_DETERMINISTIC_CHECKS_OK")

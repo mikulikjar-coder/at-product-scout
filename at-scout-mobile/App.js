@@ -19,7 +19,7 @@ import { StatusBar } from 'expo-status-bar';
 const API_URL = 'https://at-product-scout.onrender.com/api/scout';
 
 // Pipeline na serveru dělá tři sub-agenty, supervizora a případnou opravu.
-const REQUEST_TIMEOUT_MS = 180000;
+const REQUEST_TIMEOUT_MS = 240000;
 
 const C = {
   background: '#0f172a',
@@ -80,10 +80,11 @@ const LIQUIDITY_LEVELS = {
 };
 
 const PIPELINE_STAGES = [
-  'Rozpočtář prohledává diskontní značky…',
-  'Tržní arbitr srovnává ceny na Geizhals a Idealo…',
+  'Agent prohledává otevřený internet…',
+  'Srovnává rakouské e-shopy, EU sklady a výrobce…',
+  'Filtruje šunt bez certifikací a čte testy…',
   'Bazarový analytik počítá hodnotu na Willhabenu…',
-  'Supervizor audituje všechny tři karty…',
+  'Supervizor ověřuje cenu, URL a zemi odeslání…',
 ];
 
 function formatEur(value) {
@@ -218,12 +219,26 @@ function ProductCard({ item, onOpenOffers }) {
       <Text style={styles.cardTitle}>{item.name_cz}</Text>
       <Text style={styles.cardOriginal}>{item.original_title}</Text>
 
+      <View style={styles.originRow}>
+        <View style={[styles.originChip, { borderColor: theme.accent, backgroundColor: theme.chip }]}>
+          <Text style={[styles.originChipText, { color: theme.accent }]}>
+            {item.offer_origin || 'Původ nabídky'}
+          </Text>
+        </View>
+        {item.ship_from_country ? (
+          <Text style={styles.shipText}>Odeslání: {item.ship_from_country}</Text>
+        ) : null}
+      </View>
+
       <View style={styles.priceRow}>
-        <Text style={[styles.price, { color: theme.accent }]}>
-          {formatEur(item.estimated_price_eur)}
-        </Text>
+        <View>
+          <Text style={styles.priceCaption}>Nalezená nabídka</Text>
+          <Text style={[styles.price, { color: theme.accent }]}>
+            {formatEur(item.estimated_price_eur)}
+          </Text>
+        </View>
         <View style={styles.usedChip}>
-          <Text style={styles.usedChipLabel}>Willhaben</Text>
+          <Text style={styles.usedChipLabel}>Willhaben odhad</Text>
           <Text style={styles.usedChipValue}>{formatEur(item.willhaben_used_price_eur)}</Text>
         </View>
       </View>
@@ -249,25 +264,33 @@ function ProductCard({ item, onOpenOffers }) {
       <Text style={styles.targetText}>{item.verdict_target}</Text>
 
       <View style={styles.linkRow}>
-        {[
-          { label: 'Geizhals', href: item.url },
-          { label: 'Idealo', href: item.idealo_url },
-          { label: 'Willhaben', href: item.willhaben_url },
-        ].map((link) => (
-          <Pressable
-            key={link.label}
-            accessibilityRole="button"
-            disabled={!link.href}
-            onPress={() => onOpenOffers(link.href)}
-            style={({ pressed }) => [
-              styles.offerButton,
-              { borderColor: theme.accent, backgroundColor: pressed ? theme.chip : 'transparent' },
-              !link.href && styles.offerButtonDisabled,
-            ]}
-          >
-            <Text style={[styles.offerButtonText, { color: theme.accent }]}>{link.label}</Text>
-          </Pressable>
-        ))}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Otevřít nalezenou nabídku"
+          disabled={!item.url}
+          onPress={() => onOpenOffers(item.url)}
+          style={({ pressed }) => [
+            styles.offerButton,
+            styles.offerButtonPrimary,
+            { backgroundColor: pressed ? theme.chip : theme.accent },
+            !item.url && styles.offerButtonDisabled,
+          ]}
+        >
+          <Text style={styles.offerButtonPrimaryText}>Otevřít nabídku</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Zkontrolovat bazar na Willhabenu"
+          disabled={!item.willhaben_url}
+          onPress={() => onOpenOffers(item.willhaben_url)}
+          style={({ pressed }) => [
+            styles.offerButton,
+            { borderColor: theme.accent, backgroundColor: pressed ? theme.chip : 'transparent' },
+            !item.willhaben_url && styles.offerButtonDisabled,
+          ]}
+        >
+          <Text style={[styles.offerButtonText, { color: theme.accent }]}>Bazar Willhaben</Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -302,7 +325,7 @@ export default function App() {
   const handleSearch = useCallback(async () => {
     const trimmed = queryText.trim();
     if (!trimmed) {
-      setErrorMessage('Nejdřív napiš, co chceš na rakouském trhu najít.');
+      setErrorMessage('Nejdřív napiš, co chceš najít.');
       return;
     }
 
@@ -367,7 +390,7 @@ export default function App() {
         <View style={styles.header}>
           <Text style={styles.headerTitle}>AT Product Scout</Text>
           <Text style={styles.headerSubtitle}>
-            Rakouský trh (Geizhals · Idealo · Willhaben)
+            Otevřený internet, doručení do Rakouska
           </Text>
         </View>
 
@@ -457,12 +480,12 @@ export default function App() {
           {!isLoading && !errorMessage && !report && (
             <View style={styles.placeholderBox}>
               <Text style={styles.placeholderTitle}>
-                {hasSearched ? 'Žádné karty k zobrazení' : 'Tři karty pod dohledem auditora'}
+                {hasSearched ? 'Žádné karty k zobrazení' : 'Tři karty z otevřeného webu'}
               </Text>
               <Text style={styles.placeholderText}>
-                Tři sub-agenti projdou diskontní značky, srovnávače a bazar. Nezávislý
-                supervizor pak ověří rozpočet, vyhodí marketingová klišé a schválí
-                finální trojici.
+                Agent projde e-shopy, EU sklady i výrobce s doručením do Rakouska.
+                Nechá jen certifikované kusy s přímým odkazem a aktuální cenou.
+                U každé karty jde otevřít nabídka a zvlášť zkontrolovat bazar na Willhabenu.
               </Text>
             </View>
           )}
@@ -485,7 +508,8 @@ export default function App() {
               ))}
 
               <Text style={styles.disclaimer}>
-                Ceny jsou odhad pro rakouský trh. Odkaz otevře aktuální srovnání na Geizhals.at.
+                Cena a odkaz jsou z nalezené nabídky. Než koupíš, ověř je u prodejce.
+                Willhaben je kontrola bazaru, ne ta stejná nabídka.
               </Text>
             </>
           )}
@@ -738,6 +762,36 @@ const styles = StyleSheet.create({
     marginTop: 12,
     marginBottom: 6,
   },
+  originRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
+  originChip: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  originChipText: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  shipText: {
+    color: C.muted,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  priceCaption: {
+    color: C.muted,
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 2,
+  },
   price: {
     fontSize: 32,
     fontWeight: '800',
@@ -813,23 +867,37 @@ const styles = StyleSheet.create({
   },
   linkRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
     marginTop: 18,
   },
   offerButton: {
-    flex: 1,
+    flexGrow: 1,
+    flexBasis: '46%',
     borderWidth: 1.5,
     borderRadius: 12,
     paddingVertical: 12,
+    paddingHorizontal: 8,
     alignItems: 'center',
+  },
+  offerButtonPrimary: {
+    borderWidth: 0,
   },
   offerButtonDisabled: {
     opacity: 0.4,
   },
   offerButtonText: {
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '800',
-    letterSpacing: 0.3,
+    letterSpacing: 0.2,
+    textAlign: 'center',
+  },
+  offerButtonPrimaryText: {
+    color: '#f8fafc',
+    fontSize: 14,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+    textAlign: 'center',
   },
   disclaimer: {
     color: '#64748b',

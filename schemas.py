@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from typing import Literal, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -22,6 +22,13 @@ BADGE_ORDER: tuple[Badge, ...] = (
 )
 
 Priority = Literal["cheapest_possible", "balanced", "premium_brands"]
+
+OfferOrigin = Literal[
+    "Lokální rakouský e-shop",
+    "EU sklad",
+    "Direct výrobce",
+    "Globální výrobce s doručením do AT",
+]
 
 PRIORITY_LABELS: dict[Priority, str] = {
     "cheapest_possible": "Maximální úspora – rozhoduje nejnižší funkční cena.",
@@ -151,8 +158,50 @@ def marketplace_urls(original_title: str) -> dict[str, str]:
 
 
 def geizhals_search_url(original_title: str) -> str:
-    """Zpětná kompatibilita: hlavní odkaz vede na Geizhals.at."""
+    """Vyhledávání na Geizhals.at. Není to přímá nabídka."""
     return marketplace_urls(original_title)["url"]
+
+
+_SEARCH_HOSTS = {
+    "google.com",
+    "google.at",
+    "google.de",
+    "duckduckgo.com",
+    "bing.com",
+    "search.yahoo.com",
+}
+
+
+def assert_direct_offer_url(url: str) -> str:
+    """Nechá jen přímou stránku nabídky, ne výsledky vyhledávače."""
+    cleaned = _clean(url)
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if parsed.scheme not in {"http", "https"} or not host:
+        raise ValueError("url musí být přímý http(s) odkaz na nabídku.")
+    if host in _SEARCH_HOSTS or host.endswith(".google.com"):
+        raise ValueError("url nesmí vést na vyhledávač, ale na stránku nabídky.")
+    if host in {"example.com", "example.org", "localhost"}:
+        raise ValueError("url musí být reálná stránka nabídky.")
+    path = parsed.path.lower()
+    if host.endswith("bing.com") and ("aclick" in path or path.startswith("/ck/")):
+        raise ValueError("url nesmí být reklamní přesměrování, ale stránka nabídky.")
+    if "doubleclick." in host or host.endswith("googleadservices.com"):
+        raise ValueError("url nesmí být reklamní přesměrování, ale stránka nabídky.")
+    if host.endswith("google.com") and path.startswith("/aclk"):
+        raise ValueError("url nesmí být reklamní přesměrování, ale stránka nabídky.")
+
+    query = parsed.query.lower()
+    path = parsed.path.lower()
+    if "geizhals." in host and ("fs=" in query or path in {"", "/"}):
+        raise ValueError("url nesmí být vyhledávání Geizhals. Uveď přímou nabídku prodejce.")
+    if "idealo." in host and "mainsearchproductcategory" in path:
+        raise ValueError("url nesmí být vyhledávání Idealo. Uveď přímou nabídku prodejce.")
+    if "willhaben.at" in host and "keyword=" in query:
+        raise ValueError("url nesmí být vyhledávání Willhaben. Bazar má vlastní tlačítko.")
+    if "amazon." in host and path.startswith("/s"):
+        raise ValueError("url nesmí být vyhledávání Amazonu, ale karta produktu.")
+    return cleaned
 
 
 def find_banned_brands(*texts: str) -> list[str]:
@@ -211,42 +260,77 @@ class CandidateIdea(BaseModel):
 
     original_title: str = Field(
         description=(
-            "Přesný německý název výrobce a modelu, jak ho najde Geizhals.at. "
+            "Přesný název výrobce a modelu, dohledatelný na webu výrobce nebo prodejce. "
             "Nevymýšlej katalogová čísla ani neexistující řady."
         )
     )
     estimated_price_eur: float = Field(
-        gt=0, description="Odhad běžné maloobchodní ceny v Rakousku v EUR."
+        gt=0,
+        description="Aktuální cena této konkrétní nabídky v EUR, z živého výsledku hledání.",
     )
     hard_fact: str = Field(
         description="Jeden měřitelný technický parametr, ne marketingová fráze."
     )
     weak_spot: str = Field(description="Konkrétní slabina nebo chybějící funkce modelu.")
+    offer_url: str = Field(
+        description=(
+            "Přímá URL stránky produktu u prodejce, zkopírovaná z živých výsledků. "
+            "Ne vyhledávání Geizhals, Idealo, Google ani Willhaben."
+        )
+    )
+    offer_origin: OfferOrigin = Field(
+        description=(
+            "Původ nabídky: 'Lokální rakouský e-shop', 'EU sklad', "
+            "'Direct výrobce' nebo 'Globální výrobce s doručením do AT'."
+        )
+    )
+    ship_from_country: str = Field(
+        min_length=2,
+        max_length=40,
+        description="Země odeslání česky, například Rakousko, Německo nebo Nizozemsko.",
+    )
+
+    @model_validator(mode="after")
+    def normalize_candidate(self) -> CandidateIdea:
+        title = _clean(self.original_title)
+        country = _clean(self.ship_from_country)
+        if len(title) < 3 or not country:
+            raise ValueError("Kandidát musí mít model a zemi odeslání.")
+        self.original_title = title
+        self.hard_fact = _clean(self.hard_fact)
+        self.weak_spot = _clean(self.weak_spot)
+        self.ship_from_country = country
+        self.offer_url = assert_direct_offer_url(self.offer_url)
+        self.estimated_price_eur = round(float(self.estimated_price_eur), 2)
+        return self
 
 
 class BudgetScanResult(BaseModel):
     """Výstup sub-agenta 1: rozpočtář a diskontní hlídač."""
 
     strategy_note: str = Field(
-        description="Kde v Rakousku leží cenové dno této kategorie a proč."
+        description="Kde leží cenové dno spolehlivých nabídek s doručením do Rakouska a proč."
     )
     candidates: list[CandidateIdea] = Field(
         min_length=2,
         max_length=4,
-        description="Nejlevnější ještě funkční modely zavedených značek s distribucí na Geizhals.at.",
+        description=(
+            "Nejlevnější ještě spolehlivé certifikované modely s doručením do Rakouska, "
+            "včetně EU skladu nebo výrobce, když jsou výrazně výhodnější."
+        ),
     )
 
 
 class MarketScanResult(BaseModel):
-    """Výstup sub-agenta 2: tržní arbitr pro Geizhals a Idealo."""
+    """Výstup sub-agenta 2: tržní arbitr přes otevřený internet."""
 
     market_note: str = Field(
-        description="Cenová hladina kategorie na Geizhals.at a Idealo.at."
+        description="Cenová hladina kategorie na otevřeném webu, včetně EU skladů a výrobců."
     )
     value_candidates: list[CandidateIdea] = Field(
         min_length=2,
         max_length=4,
-        description="Modely s nejlepším poměrem cena/výkon na rakouském trhu.",
+        description="Modely s nejlepším poměrem spolehlivost/užitná hodnota a doručením do AT.",
     )
     trend_candidates: list[CandidateIdea] = Field(
         min_length=1,
@@ -300,15 +384,16 @@ class EvaluatedItem(BaseModel):
     )
     original_title: str = Field(
         description=(
-            "Přesný německý název výrobce a modelu pro srovnávače. "
+            "Přesný název výrobce a modelu, dohledatelný u prodejce. "
             "Nevymýšlej artikl, u nejisté varianty uveď oficiální název řady."
         )
     )
     estimated_price_eur: float = Field(
         gt=0,
         description=(
-            "Odhad běžné maloobchodní ceny v Rakousku v EUR, "
-            "včetně typického dopravného, aby v čísle nebyl skrytý poplatek."
+            "Aktuální cena nalezené nabídky v EUR. "
+            "Když živý úryvek uvádí cenu, použij ji. Dopravné do AT připočti jen tehdy, "
+            "když je v podkladech uvedené zvlášť."
         ),
     )
     pros: list[str] = Field(
@@ -340,10 +425,21 @@ class EvaluatedItem(BaseModel):
     willhaben_liquidity: Liquidity = Field(
         description="Jak rychle se model na Willhaben.at prodá."
     )
+    offer_origin: OfferOrigin = Field(
+        description=(
+            "Původ nalezené nabídky: 'Lokální rakouský e-shop', 'EU sklad', "
+            "'Direct výrobce' nebo 'Globální výrobce s doručením do AT'."
+        )
+    )
+    ship_from_country: str = Field(
+        min_length=2,
+        max_length=40,
+        description="Země, odkud prodejce zboží odesílá, česky.",
+    )
     url: str = Field(
         description=(
-            "Vyhledávací odkaz na Geizhals.at: https://geizhals.at/?fs= "
-            "plus vyčištěný a URL-encoded original_title. Nikdy produktový slug."
+            "Přímá URL konkrétní nabídky z živého hledání. "
+            "Stránka produktu u prodejce, ne výsledky vyhledávače."
         )
     )
     idealo_url: str = Field(
@@ -377,15 +473,21 @@ class EvaluatedItem(BaseModel):
         if not all(pros) or not all(cons):
             raise ValueError("Odrážky výhod a kompromisů nesmí být prázdné.")
 
+        country = _clean(self.ship_from_country)
+        if not country:
+            raise ValueError("ship_from_country nesmí být prázdná.")
+
         self.name_cz = name
         self.original_title = title
         self.verdict_target = target
         self.pros = pros
         self.cons = cons
+        self.ship_from_country = country
         self.estimated_price_eur = round(float(self.estimated_price_eur), 2)
         self.willhaben_used_price_eur = round(float(self.willhaben_used_price_eur), 2)
+        # Přímou nabídku model nesmí ztratit. Kód doplní jen kontrolu bazaru.
+        self.url = assert_direct_offer_url(self.url)
         links = marketplace_urls(title)
-        self.url = links["url"]
         self.idealo_url = links["idealo_url"]
         self.willhaben_url = links["willhaben_url"]
         return self
@@ -406,8 +508,8 @@ class FinalReport(BaseModel):
         min_length=1,
         max_length=600,
         description=(
-            "Stručné razítko supervizora: potvrzení rozpočtu a ověření, "
-            "že modely jsou dostupné na rakouském trhu. Bez marketingových frází."
+            "Stručné razítko supervizora: rozpočet, přímé nabídky s doručením do AT "
+            "a země odeslání. Bez marketingových frází."
         ),
     )
 
