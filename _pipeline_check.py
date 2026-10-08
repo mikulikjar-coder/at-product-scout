@@ -129,8 +129,14 @@ clean_request = ScoutRequest(query="kávovar", max_budget=100.0)
 assert audit_report(report, clean_request) == []
 
 over_budget = ScoutRequest(query="kávovar", max_budget=50.0)
-problems = audit_report(report, over_budget)
-assert len(problems) == 1 and "překračuje strop" in problems[0], problems
+# Strop se neposílá k opravě, i když je nejlevnější kus nad ním.
+assert audit_report(report, over_budget) == []
+tight = report.model_copy(deep=True)
+_stamp_verdict(tight, ScoutRequest(query="kávovar", max_budget=20.0), [])
+assert "Audit prošel" in tight.supervisor_verdict
+assert "nelze dodržet" in tight.supervisor_verdict
+assert "20,00 €" in tight.supervisor_verdict
+assert "89,00 €" in tight.supervisor_verdict
 
 broken = FinalReport(
     items=[

@@ -78,12 +78,14 @@ class MarketEvidence:
 
     def prompt_block(self) -> str:
         if not self.hits:
-            note = "Živé hledání teď nevrátilo žádný výsledek."
+            note = "Živé hledání selhalo nebo nic nevrátilo."
             if self.errors:
                 note += " (" + "; ".join(self.errors[:2]) + ")"
             return (
-                f"{note} Zavolej nástroj web_search, než doporučíš konkrétní model. "
-                "Bez přímé URL z výsledků hledání produkt neuváděj."
+                f"{note} To není důvod přerušit odpověď. "
+                "Sestav doporučení ze svých znalostí: reálné modely s doručením do Rakouska, "
+                "přímá URL výrobce nebo známého obchodu, orientační cena v EUR a země odeslání. "
+                "Cenu neoznačuj jako živě ověřenou."
             )
 
         lines = [
@@ -230,15 +232,18 @@ def _hits_from_rows(rows, query: str) -> list[WebHit]:
 
 
 def search_web(query: str, max_results: int = 6) -> list[WebHit]:
-    """Jedno živé hledání. Nejdřív DuckDuckGo, potom ostatní backendy knihovny ddgs."""
-    client = _load_ddgs()()
-    last_error: Exception | None = None
+    """Jedno živé hledání. Při chybě nebo timeoutu vrátí prázdný seznam, nikdy nevyhodí výjimku."""
+    try:
+        client = _load_ddgs()(timeout=5)
+    except Exception as exc:
+        logger.warning("Klient hledání nejde spustit: %s", exc)
+        return []
+
     try:
         for backend in ("duckduckgo", "auto"):
             try:
                 raw = _call_text(client, query, max(max_results * 3, 8), backend)
             except Exception as exc:
-                last_error = exc
                 logger.warning("Hledání přes %s selhalo: %s", backend, exc)
                 continue
             hits = [
@@ -248,13 +253,17 @@ def search_web(query: str, max_results: int = 6) -> list[WebHit]:
             ]
             if hits:
                 return hits[:max_results]
-        if last_error is not None:
-            raise last_error
+        return []
+    except Exception as exc:
+        logger.warning("Hledání spadlo pro %r: %s", query, exc)
         return []
     finally:
         close = getattr(client, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                logger.warning("Zavření klienta hledání selhalo.", exc_info=True)
 
 
 def search_tavily(query: str, max_results: int = 6) -> list[WebHit]:

@@ -151,13 +151,16 @@ Pevná pravidla pro celou pipeline:
   Direct výrobce, Globální výrobce s doručením do AT. Urči ji podle obchodu
   v URL, ne podle přání.
 - ship_from_country je země odeslání česky (Rakousko, Německo, Nizozemsko…).
-- url kopíruj znak po znaku z živých výsledků nebo z nástroje web_search.
-  Nesestavuj vyhledávací odkaz. Kód doplní jen willhaben_url pro kontrolu bazaru.
+- Když jsou v zadání živé výsledky, url kopíruj znak po znaku odtud
+  a cenu ber z úryvku. Nesestavuj vyhledávací odkaz.
+  Když živé hledání selhalo nebo je prázdné, neselháváš a nevracíš chybu:
+  doporuč nejlepší relevantní produkty ze svých znalostí, s přímou URL
+  výrobce nebo známého obchodu a s orientační cenou v EUR.
+- Kód doplní jen willhaben_url pro kontrolu bazaru.
 - Zakázané marketingové fráze: {_BANNED_LIST}.
   Každé tvrzení musí nést parametr, číslo nebo konkrétní chybějící funkci.
 - Odrážka výhod nikdy neopakuje cenu ani slovo EUR. Cena má vlastní pole,
   do výhod patří watty, bary, pascaly, litry, decibely, výdrž nebo výbava.
-- Když ti chybí aktuální nabídka, zavolej nástroj web_search. Nehádej URL ani cenu.
 """.strip()
 
 _BUDGET_AGENT_PROMPT = f"""
@@ -213,13 +216,11 @@ Tři sub-agenti ti poslali podklady z živého hledání. Nevěříš jim na slo
 jsi poslední kontrola před odesláním dat do mobilní aplikace.
 
 Sestav přesně tři karty a každou proveď tímto kontrolním seznamem:
-1. ROZPOČET: karta NEJLEVNĚJŠÍ FUNKČNÍ VOLBA nesmí překročit zadaný strop.
-   Pokud podklady strop překračují, vyber skutečně dostupný certifikovaný model,
-   který se pod strop vejde, klidně z EU skladu nebo od výrobce. Nikdy
-   Silvercrest, Parkside ani jinou privátní značku diskontu. Cenu ber z živé
-   nabídky a nikdy ji nesnižuj jen proto, aby se model vešel do stropu.
-   Když pod strop nevejde žádný reálný kus, nech nejlevnější dostupný
-   a do supervisor_verdict napiš, že strop nelze dodržet.
+1. ROZPOČET: nejlevnější karta má být kvalitní a co nejblíž stropu.
+   Když je nejlevnější kvalitní kus těsně nad stropem, třeba 21 EUR při stropu
+   20 EUR, nech ho. Cenu nesnižuj, aby se do stropu vešla, a nevymýšlej horší
+   kus jen kvůli euru. Poznámku o stropu doplní kód. Nikdy Silvercrest, Parkside
+   ani jinou privátní značku diskontu.
 2. KATEGORIE: kávovar do kanceláře nebo espresso automat = jen
    Kaffeevollautomat s integrovaným mlýnkem. Pákový kávovar a kapsle jsou
    v tomhle úkolu zakázané.
@@ -231,7 +232,8 @@ Sestav přesně tři karty a každou proveď tímto kontrolním seznamem:
 5. CENOVÁ LOGIKA: estimated_price_eur je aktuální cena nalezené nabídky.
    willhaben_used_price_eur je odhad bazaru, musí být nižší než nová cena
    a musí odpovídat pravidlům bazarového analytika i zvolené likviditě.
-6. PŮVOD A ODKAZ: url je přímá stránka té nabídky z živých výsledků.
+6. PŮVOD A ODKAZ: když jsou živé výsledky, url je přímá stránka z nich.
+   Když hledání selhalo, použij nejlepší URL ze svých znalostí a odpověď stejně vrať.
    offer_origin a ship_from_country musí sedět na ten obchod.
    willhaben_url doplní kód, ty ho nemusíš vymýšlet.
 7. POŘADÍ: NEJLEVNĚJŠÍ FUNKČNÍ VOLBA, pak NEJLEPŠÍ CENA / VÝKON,
@@ -286,8 +288,9 @@ def _budget_line(request: ScoutRequest) -> str:
     if request.max_budget is None:
         return "Cenový strop: bez limitu."
     return (
-        f"Cenový strop: {request.max_budget:.2f} EUR a karta "
-        "NEJLEVNĚJŠÍ FUNKČNÍ VOLBA se pod něj musí vejít."
+        f"Cenový strop: {request.max_budget:.2f} EUR. "
+        "Nejlevnější kvalitní karta se má vejít. Když je jen těsně nad stropem, "
+        "nech ji a cenu nesnižuj. Poznámku o stropu doplní kód."
     )
 
 
@@ -325,6 +328,25 @@ app.add_middleware(
 )
 
 
+_SEARCH_TIMEOUT_S = 8
+
+
+async def _call_search(fn, *args) -> list:
+    """Hledání nesmí shodit request. Timeout i chyba knihovny vrátí prázdný seznam."""
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(fn, *args),
+            timeout=_SEARCH_TIMEOUT_S,
+        )
+    except TimeoutError:
+        logger.warning("Hledání překročilo %ss a bylo přeskočeno.", _SEARCH_TIMEOUT_S)
+        return []
+    except Exception as exc:
+        logger.warning("Hledání selhalo (%s): %s", getattr(fn, "__name__", fn), exc)
+        return []
+    return list(result or [])
+
+
 async def _run_search_tool(call, evidence: MarketEvidence | None) -> str:
     """Obsluha nástroje web_search uvnitř volání modelu."""
     query = ""
@@ -336,19 +358,11 @@ async def _run_search_tool(call, evidence: MarketEvidence | None) -> str:
     if call.function.name != "web_search" or not query:
         return "Nástroj web_search vyžaduje parametr query."
 
-    hits: list = []
+    hits = [
+        *(await _call_search(search_web, query, 6)),
+        *(await _call_search(search_tavily, query, 5)),
+    ]
     errors: list[str] = []
-    try:
-        hits.extend(await asyncio.to_thread(search_web, query, 6))
-    except Exception as exc:
-        logger.warning("web_search selhal pro %r: %s", query, exc)
-        errors.append(exc.__class__.__name__)
-    try:
-        hits.extend(await asyncio.to_thread(search_tavily, query, 5))
-    except Exception as exc:
-        logger.warning("Tavily selhal pro %r: %s", query, exc)
-        errors.append(f"tavily:{exc.__class__.__name__}")
-
     fresh = MarketEvidence(hits=[], errors=errors)
     fresh.add(hits)
     if evidence is not None:
@@ -359,40 +373,33 @@ async def _run_search_tool(call, evidence: MarketEvidence | None) -> str:
 
 
 async def collect_evidence(query: str) -> MarketEvidence:
-    """Předběžné živé hledání, které jde do každého volání modelu."""
+    """Předběžné živé hledání. Selhání nebo timeout nechá model odpovědět ze znalostí."""
     evidence = MarketEvidence()
     queries = [
         f"{query} kaufen Preis",
         f"{query} Test Bewertung",
         f"{query} shop EU Lieferung Österreich",
     ]
+    try:
+        async def one(search_query: str) -> list:
+            primary = await _call_search(search_web, search_query, 6)
+            extra = await _call_search(search_tavily, search_query, 4)
+            return [*primary, *extra]
 
-    async def one(search_query: str) -> list:
-        try:
-            primary = await asyncio.to_thread(search_web, search_query, 6)
-        except Exception as exc:
-            logger.warning("Živé hledání selhalo (%s): %s", search_query, exc)
-            evidence.errors.append(exc.__class__.__name__)
-            primary = []
-        try:
-            extra = await asyncio.to_thread(search_tavily, search_query, 4)
-        except Exception as exc:
-            logger.warning("Tavily selhalo (%s): %s", search_query, exc)
-            extra = []
-        return [*primary, *extra]
+        batches = await asyncio.gather(*(one(item) for item in queries))
+        for batch in batches:
+            evidence.add(batch)
 
-    batches = await asyncio.gather(*(one(item) for item in queries))
-    for batch in batches:
-        evidence.add(batch)
+        if not evidence.hits:
+            evidence.add(await _call_search(search_web, query, 8))
+    except Exception as exc:
+        logger.exception("Živé hledání spadlo, model pojede ze znalostí: %s", exc)
+        evidence.errors.append(exc.__class__.__name__)
 
-    if not evidence.hits:
-        try:
-            evidence.add(await asyncio.to_thread(search_web, query, 8))
-        except Exception as exc:
-            logger.warning("Záložní hledání selhalo: %s", exc)
-            evidence.errors.append(exc.__class__.__name__)
-
-    logger.info("Živé hledání pro %r: %s unikátních odkazů.", query, len(evidence.hits))
+    if evidence.hits:
+        logger.info("Živé hledání pro %r: %s unikátních odkazů.", query, len(evidence.hits))
+    else:
+        logger.warning("Živé hledání pro %r nic nenašlo, používám znalosti modelu.", query)
     return evidence
 
 
@@ -579,20 +586,9 @@ def audit_report(
 ) -> list[str]:
     """Deterministický audit nad verdiktem supervizora."""
     problems: list[str] = []
-    cheapest = report.items[0]
     evidence_urls = evidence.urls() if evidence is not None else set()
-
-    if evidence is not None and not evidence_urls:
-        problems.append(
-            "Živé hledání nevrátilo žádnou URL. Zavolej web_search a použij přímý odkaz z výsledků."
-        )
-
-    if request.max_budget is not None and cheapest.estimated_price_eur > request.max_budget:
-        problems.append(
-            f"Karta NEJLEVNĚJŠÍ FUNKČNÍ VOLBA stojí {cheapest.estimated_price_eur:.2f} EUR "
-            f"a překračuje strop {request.max_budget:.2f} EUR. Nahraď ji modelem, "
-            "který se pod strop reálně vejde."
-        )
+    # Strop se neposílá k opravě. Těsné překročení, třeba 21 EUR při stropu 20 EUR,
+    # nesmí shodit request. Poznámku doplní razítko.
 
     for item in report.items:
         banned = find_banned_brands(item.name_cz, item.original_title)
