@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -19,7 +18,6 @@ from openai import (
     APITimeoutError,
     AsyncOpenAI,
     AuthenticationError,
-    BadRequestError,
     ContentFilterFinishReasonError,
     LengthFinishReasonError,
     RateLimitError,
@@ -261,29 +259,6 @@ _PRIORITY_HINTS: dict[str, str] = {
     ),
 }
 
-_WEB_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "web_search",
-        "description": (
-            "Prohledá otevřený internet a vrátí titulky, přímé URL, úryvky a ceny v EUR. "
-            "Použij pro aktuální nabídku, test, certifikaci a zemi odeslání."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Konkrétní dotaz, například model plus Preis, Test nebo shop.",
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
 def _budget_line(request: ScoutRequest) -> str:
     if request.max_budget is None:
         return "Cenový strop: bez limitu."
@@ -347,33 +322,12 @@ async def _call_search(fn, *args) -> list:
     return list(result or [])
 
 
-async def _run_search_tool(call, evidence: MarketEvidence | None) -> str:
-    """Obsluha nástroje web_search uvnitř volání modelu."""
-    query = ""
-    try:
-        args = json.loads(call.function.arguments or "{}")
-        query = str(args.get("query") or "").strip()[:300]
-    except json.JSONDecodeError:
-        query = ""
-    if call.function.name != "web_search" or not query:
-        return "Nástroj web_search vyžaduje parametr query."
-
-    hits = [
-        *(await _call_search(search_web, query, 6)),
-        *(await _call_search(search_tavily, query, 5)),
-    ]
-    errors: list[str] = []
-    fresh = MarketEvidence(hits=[], errors=errors)
-    fresh.add(hits)
-    if evidence is not None:
-        evidence.add(fresh.hits)
-        evidence.errors.extend(errors)
-    logger.info("web_search %r vrátil %s odkazů.", query, len(fresh.hits))
-    return fresh.prompt_block()
-
-
 async def collect_evidence(query: str) -> MarketEvidence:
-    """Předběžné živé hledání. Selhání nebo timeout nechá model odpovědět ze znalostí."""
+    """Předběžné živé hledání vložené do promptu jako text.
+
+    429, timeout i pád DuckDuckGo nebo Brave nesmí shodit požadavek.
+    Prázdná evidence znamená, že model odpoví ze svých znalostí.
+    """
     evidence = MarketEvidence()
     queries = [
         f"{query} kaufen Preis",
@@ -382,9 +336,14 @@ async def collect_evidence(query: str) -> MarketEvidence:
     ]
     try:
         async def one(search_query: str) -> list:
-            primary = await _call_search(search_web, search_query, 6)
-            extra = await _call_search(search_tavily, search_query, 4)
-            return [*primary, *extra]
+            try:
+                primary = await _call_search(search_web, search_query, 6)
+                extra = await _call_search(search_tavily, search_query, 4)
+                return [*primary, *extra]
+            except Exception as exc:
+                logger.warning("Dotaz %r přeskočen: %s", search_query, exc)
+                evidence.errors.append(exc.__class__.__name__)
+                return []
 
         batches = await asyncio.gather(*(one(item) for item in queries))
         for batch in batches:
@@ -411,10 +370,9 @@ async def _parse_structured(
     max_tokens: int,
     temperature: float,
     attempts: int = 2,
-    evidence: MarketEvidence | None = None,
 ) -> _TModel:
-    """Structured Outputs s nástrojem web_search. Nevalidní odpověď zkusí ještě jednou."""
-    base_messages = [
+    """Structured Outputs. Živé výsledky jsou už v textu zprávy, ne jako function tool."""
+    messages = [
         {"role": "system", "content": MASTER_SYSTEM_PROMPT},
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -422,73 +380,21 @@ async def _parse_structured(
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
-        messages: list[dict] = list(base_messages)
-        allow_tools = True
-        tool_rounds = 0
         try:
-            while True:
-                kwargs: dict = {
-                    "model": MODEL,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "messages": messages,
-                    "response_format": schema,
-                }
-                if allow_tools and tool_rounds < 2:
-                    kwargs["tools"] = [_WEB_SEARCH_TOOL]
-                    kwargs["tool_choice"] = "auto"
-                try:
-                    completion = await client.beta.chat.completions.parse(**kwargs)
-                except TypeError:
-                    if allow_tools:
-                        logger.warning("SDK nebere tools u parse(), jedu jen s vloženými výsledky.")
-                        allow_tools = False
-                        continue
-                    raise
-                except BadRequestError as exc:
-                    if allow_tools and "tool" in str(exc).lower():
-                        logger.warning("API odmítlo tools spolu se schématem, jedu bez nich.")
-                        allow_tools = False
-                        continue
-                    raise
-
-                message = completion.choices[0].message
-                tool_calls = message.tool_calls or []
-                if tool_calls and allow_tools and tool_rounds < 2:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": message.content or None,
-                            "tool_calls": [
-                                {
-                                    "id": call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.function.name,
-                                        "arguments": call.function.arguments,
-                                    },
-                                }
-                                for call in tool_calls
-                            ],
-                        }
-                    )
-                    for call in tool_calls:
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call.id,
-                                "content": await _run_search_tool(call, evidence),
-                            }
-                        )
-                    tool_rounds += 1
-                    continue
-
-                if message.refusal:
-                    raise RuntimeError(f"Model odmítl odpovědět: {message.refusal}")
-                if message.parsed is None:
-                    last_error = RuntimeError("Model nevrátil strukturovaná data.")
-                    break
-                return message.parsed
+            completion = await client.beta.chat.completions.parse(
+                model=MODEL,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=messages,
+                response_format=schema,
+            )
+            message = completion.choices[0].message
+            if message.refusal:
+                raise RuntimeError(f"Model odmítl odpovědět: {message.refusal}")
+            if message.parsed is None:
+                last_error = RuntimeError("Model nevrátil strukturovaná data.")
+                continue
+            return message.parsed
         except (ValidationError, LengthFinishReasonError) as exc:
             last_error = exc
             logger.warning("%s: pokus %s neprošel schématem.", schema.__name__, attempt)
@@ -512,7 +418,6 @@ async def run_subagents(
             f"{brief}\n\nNajdi cenové dno spolehlivých nabídek s doručením do Rakouska.",
             max_tokens=1800,
             temperature=0.3,
-            evidence=evidence,
         ),
         _parse_structured(
             MarketScanResult,
@@ -523,7 +428,6 @@ async def run_subagents(
             ),
             max_tokens=2200,
             temperature=0.3,
-            evidence=evidence,
         ),
         _parse_structured(
             ResaleScanResult,
@@ -531,7 +435,6 @@ async def run_subagents(
             f"{brief}\n\nUrči pravidla zůstatkové hodnoty na Willhaben.at.",
             max_tokens=1000,
             temperature=0.3,
-            evidence=evidence,
         ),
     )
     return budget_scan, market_scan, resale_scan
@@ -737,7 +640,6 @@ async def supervise(
         _supervisor_brief(request, budget_scan, market_scan, resale_scan, evidence),
         max_tokens=4000,
         temperature=0.1,
-        evidence=evidence,
     )
 
     problems = audit_report(report, request, known_prices, evidence)
@@ -756,7 +658,6 @@ async def supervise(
             repair_brief,
             max_tokens=4000,
             temperature=0.0,
-            evidence=evidence,
         )
         problems = audit_report(report, request, known_prices, evidence)
 
@@ -781,7 +682,13 @@ async def scout(payload: ScoutRequest) -> FinalReport:
         payload.priority,
     )
     try:
-        evidence = await collect_evidence(payload.query)
+        try:
+            evidence = await collect_evidence(payload.query)
+        except Exception as exc:
+            logger.exception(
+                "Evidence se nepodařilo načíst, model pojede ze znalostí: %s", exc
+            )
+            evidence = MarketEvidence(errors=[exc.__class__.__name__])
         budget_scan, market_scan, resale_scan = await run_subagents(payload, evidence)
         logger.info(
             "Fáze 1 hotova: %s + %s + %s kandidátů.",
