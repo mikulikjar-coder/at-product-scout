@@ -6,7 +6,6 @@ import {
   Linking,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StatusBar as RNStatusBar,
   StyleSheet,
@@ -15,6 +14,7 @@ import {
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 const API_URL = 'https://at-product-scout.onrender.com/api/scout';
 
@@ -195,6 +195,17 @@ function LiquidityMeter({ liquidity }) {
   );
 }
 
+function buyUrlFor(item) {
+  if (item?.buy_url) {
+    return item.buy_url;
+  }
+  const name = (item?.original_title || item?.name_cz || '').trim();
+  if (!name) {
+    return '';
+  }
+  return `https://www.google.at/search?tbm=shop&q=${encodeURIComponent(name)}`;
+}
+
 function Bullet({ symbol, color, children }) {
   return (
     <View style={styles.bulletRow}>
@@ -206,6 +217,7 @@ function Bullet({ symbol, color, children }) {
 
 function ProductCard({ item, onOpenOffers }) {
   const theme = BADGE_THEMES[item.badge] ?? FALLBACK_THEME;
+  const buyUrl = buyUrlFor(item);
 
   return (
     <View style={[styles.card, { borderColor: theme.accent, backgroundColor: theme.surface }]}>
@@ -266,18 +278,44 @@ function ProductCard({ item, onOpenOffers }) {
       <View style={styles.linkRow}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Otevřít nalezenou nabídku"
-          disabled={!item.url}
-          onPress={() => onOpenOffers(item.url)}
+          accessibilityLabel="Koupit nebo zobrazit nabídky na Google Shopping"
+          disabled={!buyUrl}
+          onPress={() => onOpenOffers(buyUrl)}
           style={({ pressed }) => [
             styles.offerButton,
             styles.offerButtonPrimary,
             { backgroundColor: pressed ? theme.chip : theme.accent },
-            !item.url && styles.offerButtonDisabled,
+            !buyUrl && styles.offerButtonDisabled,
           ]}
         >
-          <Text style={styles.offerButtonPrimaryText}>Otevřít nabídku</Text>
+          <Text style={styles.offerButtonPrimaryText}>Koupit / Nabídky</Text>
         </Pressable>
+        {item.geizhals_url ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Otevřít srovnání na Geizhals"
+            onPress={() => onOpenOffers(item.geizhals_url)}
+            style={({ pressed }) => [
+              styles.offerButton,
+              { borderColor: theme.accent, backgroundColor: pressed ? theme.chip : 'transparent' },
+            ]}
+          >
+            <Text style={[styles.offerButtonText, { color: theme.accent }]}>Geizhals</Text>
+          </Pressable>
+        ) : null}
+        {item.idealo_url ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Otevřít srovnání na Idealo"
+            onPress={() => onOpenOffers(item.idealo_url)}
+            style={({ pressed }) => [
+              styles.offerButton,
+              { borderColor: theme.accent, backgroundColor: pressed ? theme.chip : 'transparent' },
+            ]}
+          >
+            <Text style={[styles.offerButtonText, { color: theme.accent }]}>Idealo</Text>
+          </Pressable>
+        ) : null}
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Zkontrolovat bazar na Willhabenu"
@@ -381,7 +419,8 @@ export default function App() {
   const canSubmit = queryText.trim().length > 0 && !isLoading;
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safeArea}>
       <StatusBar style="light" backgroundColor={C.background} />
       <KeyboardAvoidingView
         style={styles.flex}
@@ -508,14 +547,16 @@ export default function App() {
               ))}
 
               <Text style={styles.disclaimer}>
-                Cena a odkaz jsou z nalezené nabídky. Než koupíš, ověř je u prodejce.
-                Willhaben je kontrola bazaru, ne ta stejná nabídka.
+                Cena je odhad z analýzy. Koupit / Nabídky otevře Google Shopping v Rakousku,
+                takže se dostaneš na reálné e-shopy. Geizhals a Idealo jsou srovnání,
+                Willhaben je kontrola bazaru.
               </Text>
             </>
           )}
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -882,6 +923,7 @@ const styles = StyleSheet.create({
   },
   offerButtonPrimary: {
     borderWidth: 0,
+    flexBasis: '100%',
   },
   offerButtonDisabled: {
     opacity: 0.4,

@@ -147,11 +147,19 @@ def clean_search_query(original_title: str) -> str:
     return " ".join(kept or tokens)
 
 
+def buy_url_for(product_name: str) -> str:
+    """Google Shopping AT. Název se jen zakóduje, cesta na webu výrobce se neskládá."""
+    name = " ".join(product_name.split())
+    return f"https://www.google.at/search?tbm=shop&q={quote_plus(name)}"
+
+
 def marketplace_urls(original_title: str) -> dict[str, str]:
-    """Přímé vyhledávání na Geizhals, Idealo a Willhaben podle vyčištěného názvu."""
+    """Vyhledávání na Geizhals, Idealo a Willhaben podle vyčištěného názvu."""
     query = quote_plus(clean_search_query(original_title))
+    geizhals_url = GEIZHALS_SEARCH.format(query=query)
     return {
-        "url": GEIZHALS_SEARCH.format(query=query),
+        "url": geizhals_url,
+        "geizhals_url": geizhals_url,
         "idealo_url": IDEALO_SEARCH.format(query=query),
         "willhaben_url": WILLHABEN_SEARCH.format(query=query),
     }
@@ -273,10 +281,12 @@ class CandidateIdea(BaseModel):
     )
     weak_spot: str = Field(description="Konkrétní slabina nebo chybějící funkce modelu.")
     offer_url: str = Field(
+        default="",
         description=(
-            "Přímá URL stránky produktu u prodejce, zkopírovaná z živých výsledků. "
-            "Ne vyhledávání Geizhals, Idealo, Google ani Willhaben."
-        )
+            "Jen URL zkopírovaná znak po znaku z živých výsledků. "
+            "Když v podkladech není, nech prázdné. "
+            "Nevymýšlej cestu na webu výrobce, katalogové číslo v adrese ani 404 stránku."
+        ),
     )
     offer_origin: OfferOrigin = Field(
         description=(
@@ -300,7 +310,8 @@ class CandidateIdea(BaseModel):
         self.hard_fact = _clean(self.hard_fact)
         self.weak_spot = _clean(self.weak_spot)
         self.ship_from_country = country
-        self.offer_url = assert_direct_offer_url(self.offer_url)
+        # Nevynucuj přímou URL. Vymyšlená cesta výrobce se do karty stejně nedostane.
+        self.offer_url = _clean(self.offer_url)
         self.estimated_price_eur = round(float(self.estimated_price_eur), 2)
         return self
 
@@ -437,10 +448,22 @@ class EvaluatedItem(BaseModel):
         description="Země, odkud prodejce zboží odesílá, česky.",
     )
     url: str = Field(
+        default="",
         description=(
-            "Přímá URL konkrétní nabídky z živého hledání. "
-            "Stránka produktu u prodejce, ne výsledky vyhledávače."
-        )
+            "Nech prázdné. Nevymýšlej přímou URL výrobce ani katalogovou cestu. "
+            "Kód sem vloží Google Shopping AT podle přesného názvu produktu."
+        ),
+    )
+    buy_url: str = Field(
+        default="",
+        description=(
+            "Nech prázdné. Kód doplní "
+            "https://www.google.at/search?tbm=shop&q= a přesný název produktu."
+        ),
+    )
+    geizhals_url: str = Field(
+        default="",
+        description="Nech prázdné. Kód doplní vyhledávání na Geizhals.at.",
     )
     idealo_url: str = Field(
         default="",
@@ -485,9 +508,11 @@ class EvaluatedItem(BaseModel):
         self.ship_from_country = country
         self.estimated_price_eur = round(float(self.estimated_price_eur), 2)
         self.willhaben_used_price_eur = round(float(self.willhaben_used_price_eur), 2)
-        # Přímou nabídku model nesmí ztratit. Kód doplní jen kontrolu bazaru.
-        self.url = assert_direct_offer_url(self.url)
+        # Model nesmí prosadit vymyšlenou cestu. Hlavní nákupní odkaz je vždy Google Shopping AT.
         links = marketplace_urls(title)
+        self.buy_url = buy_url_for(title)
+        self.url = self.buy_url
+        self.geizhals_url = links["geizhals_url"]
         self.idealo_url = links["idealo_url"]
         self.willhaben_url = links["willhaben_url"]
         return self

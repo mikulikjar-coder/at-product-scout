@@ -38,7 +38,6 @@ from schemas import (
 )
 from web_search import (
     MarketEvidence,
-    canonical_url,
     price_matches,
     search_tavily,
     search_web,
@@ -111,9 +110,9 @@ Rozsah:
 - Lokální rakouský e-shop je v pořádku. Když existuje výrazně výhodnější
   a stejně kvalitní alternativa z EU skladu, direct-to-consumer obchodu
   výrobce nebo od globálního výrobce s doručením do AT, zařaď ji.
-- U každého produktu uveď přímou URL konkrétní nabídky (stránka produktu
-  u prodejce, ne výsledky vyhledávání), aktuální cenu v EUR z té nabídky
-  a zemi odeslání.
+- U každého produktu uveď přesný název výrobce a modelu, aktuální cenu v EUR
+  a zemi odeslání. Přímou URL stránky nevymýšlej. Nákupní odkaz skládá kód
+  jako Google Shopping Rakousko z toho názvu, aby tlačítko nikdy nekončilo na 404.
 
 Kvalitativní filtr:
 - Vyřaď nebezpečný šunt bez certifikace. U elektroniky a strojů požaduj
@@ -147,14 +146,15 @@ Pevná pravidla pro celou pipeline:
   zvlášť, a v kompromisu to řekni.
 - offer_origin je jedna z hodnot: Lokální rakouský e-shop, EU sklad,
   Direct výrobce, Globální výrobce s doručením do AT. Urči ji podle obchodu
-  v URL, ne podle přání.
+  v živých výsledcích, ne podle přání.
 - ship_from_country je země odeslání česky (Rakousko, Německo, Nizozemsko…).
-- Když jsou v zadání živé výsledky, url kopíruj znak po znaku odtud
-  a cenu ber z úryvku. Nesestavuj vyhledávací odkaz.
-  Když živé hledání selhalo nebo je prázdné, neselháváš a nevracíš chybu:
-  doporuč nejlepší relevantní produkty ze svých znalostí, s přímou URL
-  výrobce nebo známého obchodu a s orientační cenou v EUR.
-- Kód doplní jen willhaben_url pro kontrolu bazaru.
+- ZÁKAZ halucinace URL: nevymýšlej cestu na webu výrobce, katalogové číslo
+  v adrese ani stránku, která není doslova mezi živými výsledky.
+  Taková adresa končí 404 a do odpovědi nepatří.
+- offer_url vyplň jen tehdy, když je celá adresa zkopírovaná z živých výsledků.
+  Jinak ji nech prázdnou. Když živé hledání selhalo, doporuč reálné modely
+  ze svých znalostí s orientační cenou v EUR a adresu nevymýšlej.
+- Nákupní odkaz, Geizhals, Idealo a Willhaben doplní kód. Ty je nevymýšlej.
 - Zakázané marketingové fráze: {_BANNED_LIST}.
   Každé tvrzení musí nést parametr, číslo nebo konkrétní chybějící funkci.
 - Odrážka výhod nikdy neopakuje cenu ani slovo EUR. Cena má vlastní pole,
@@ -174,8 +174,8 @@ nebo od výrobce výrazně levnější než rakouský e-shop, ber ten levnějš�
 Tvoje práce:
 - strategy_note: kde leží cenové dno spolehlivých nabídek s doručením do AT.
 - candidates: nejlevnější certifikované modely, které ještě zvládnou hlavní
-  úkol. U každého přímá URL, aktuální cena, země odeslání, jeden měřitelný
-  parametr a jedna konkrétní slabina.
+  úkol. U každého aktuální cena, země odeslání, jeden měřitelný
+  parametr a jedna konkrétní slabina. URL výrobce nevymýšlej.
 
 {_SHARED_RULES}
 """.strip()
@@ -230,10 +230,9 @@ Sestav přesně tři karty a každou proveď tímto kontrolním seznamem:
 5. CENOVÁ LOGIKA: estimated_price_eur je aktuální cena nalezené nabídky.
    willhaben_used_price_eur je odhad bazaru, musí být nižší než nová cena
    a musí odpovídat pravidlům bazarového analytika i zvolené likviditě.
-6. PŮVOD A ODKAZ: když jsou živé výsledky, url je přímá stránka z nich.
-   Když hledání selhalo, použij nejlepší URL ze svých znalostí a odpověď stejně vrať.
-   offer_origin a ship_from_country musí sedět na ten obchod.
-   willhaben_url doplní kód, ty ho nemusíš vymýšlet.
+6. PŮVOD: offer_origin a ship_from_country musí sedět na obchod z podkladů.
+   Nevymýšlej přímou URL. Pole url, buy_url, geizhals_url, idealo_url
+   a willhaben_url doplní kód. Hlavní nákupní odkaz je Google Shopping AT.
 7. POŘADÍ: NEJLEVNĚJŠÍ FUNKČNÍ VOLBA, pak NEJLEPŠÍ CENA / VÝKON,
    pak MODERNÍ TREND / INOVACE.
 
@@ -489,7 +488,6 @@ def audit_report(
 ) -> list[str]:
     """Deterministický audit nad verdiktem supervizora."""
     problems: list[str] = []
-    evidence_urls = evidence.urls() if evidence is not None else set()
     # Strop se neposílá k opravě. Těsné překročení, třeba 21 EUR při stropu 20 EUR,
     # nesmí shodit request. Poznámku doplní razítko.
 
@@ -531,7 +529,11 @@ def audit_report(
             )
 
         quoted = (known_prices or {}).get(_title_key(item.original_title))
-        live_prices = evidence.prices_for(item.url) if evidence is not None else []
+        live_prices: list[float] = []
+        if evidence is not None:
+            live_prices = evidence.prices_for(item.url)
+            if not live_prices:
+                live_prices = evidence.prices_for_title(item.original_title)
         if (
             quoted is not None
             and item.estimated_price_eur < quoted * PRICE_TOLERANCE
@@ -549,11 +551,6 @@ def audit_report(
                 f"Karta '{item.name_cz}' uvádí {item.estimated_price_eur:.2f} EUR, "
                 f"ale živý úryvek u stejné URL uvádí {shown} EUR. "
                 "Použij aktuální cenu z nalezené nabídky."
-            )
-        if evidence_urls and canonical_url(item.url) not in evidence_urls:
-            problems.append(
-                f"Karta '{item.name_cz}' má URL, která není mezi živě nalezenými odkazy. "
-                "Nahraď ji přímou URL z výsledků hledání."
             )
 
     verdict_cliches = find_cliches(report.supervisor_verdict)
@@ -617,7 +614,7 @@ def _stamp_verdict(
         audit_note = f"Audit s výhradou: {budget_note}, {_remarks(len(unresolved))}."
     else:
         audit_note = (
-            f"Audit prošel: {budget_note}, přímé nabídky z otevřeného webu, "
+            f"Audit prošel: {budget_note}, nákup přes Google Shopping AT, "
             "bazarové ceny pod novou cenou."
         )
 
