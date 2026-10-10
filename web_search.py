@@ -97,11 +97,9 @@ class MarketEvidence:
             if self.errors:
                 note += " (" + "; ".join(self.errors[:2]) + ")"
             return (
-                f"{note} To není důvod přerušit odpověď. "
-                "Sestav doporučení ze svých znalostí: reálné modely s doručením do Rakouska, "
-                "orientační cena v EUR a země odeslání. "
-                "Nevymýšlej URL výrobce ani katalogovou cestu. "
-                "Nákupní odkaz doplní kód jako Google Shopping AT."
+                f"{note} Nevyplňuj to pamětí modelu. "
+                "Nevymýšlej značku, modelové číslo ani cenu. "
+                "Když tu nejsou živé nabídky, kód vrátí hlášení a nic se nedoplňuje."
             )
 
         lines = [

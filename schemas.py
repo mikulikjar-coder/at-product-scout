@@ -147,10 +147,92 @@ def clean_search_query(original_title: str) -> str:
     return " ".join(kept or tokens)
 
 
+# Záporná slova drží Google Shopping u stroje, ne u těsnění a náhradních dílů.
+_SHOPPING_EXCLUDES: tuple[str, ...] = (
+    "-náhradní",
+    "-díl",
+    "-těsnění",
+    "-příslušenství",
+    "-ersatzteil",
+    "-zubehör",
+    "-dichtung",
+)
+
+_SHOPPING_NOISE = _SEARCH_NOISE | {
+    "espresso",
+    "series",
+    "serie",
+    "řada",
+    "rada",
+    "pákový",
+    "pakovy",
+    "pakový",
+    "siebträger",
+    "siebtraeger",
+    "portafilter",
+    "coffee",
+    "machine",
+    "maschine",
+    "style",
+    "latte",
+    "lattego",
+}
+
+# Nejdřív kód s oddělovačem (ECAM290.61.SB, EP5447/90, EC 685.M), pak holé číslo (HD8651, E0403).
+_MODEL_CODE_RE = re.compile(
+    r"(?<![A-Za-z0-9])("
+    r"[A-Z]{1,6}\s?\d{2,5}(?:[.\-/][A-Z0-9]{1,6})+"
+    r"|[A-Z]{1,6}\s?\d{3,5}[A-Z]{0,4}"
+    r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _shopping_text(original_title: str) -> str:
+    """Jako čistý název pro srovnávač, ale lomítko v modelovém čísle nechá být."""
+    text = original_title.replace("\u00a0", " ")
+    text = re.sub(r'[«»“”"„]', "", text)
+    text = re.sub(r"[|]+", " ", text)
+    text = re.sub(r"[^\w.+'\-/ ]+", " ", text, flags=re.UNICODE)
+    tokens = [token for token in text.split() if token]
+    kept = [token for token in tokens if token.lower().strip(".,") not in _SEARCH_NOISE]
+    return " ".join(kept or tokens)
+
+
+def _brand_token(tokens: list[str]) -> str:
+    """První slovo, které je značka: má písmena a není kategorie ani barva."""
+    for token in tokens:
+        key = token.lower().strip(".,")
+        if key in _SHOPPING_NOISE or not any(char.isalpha() for char in token):
+            continue
+        return token
+    return ""
+
+
+def shopping_focus(original_title: str) -> str:
+    """Do nákupního dotazu jde jen značka a modelové číslo, ne celý název."""
+    cleaned = _shopping_text(original_title)
+    match = _MODEL_CODE_RE.search(cleaned)
+    if match is None:
+        tokens = [
+            token
+            for token in cleaned.split()
+            if token.lower().strip(".,") not in _SHOPPING_NOISE
+        ]
+        return " ".join(tokens[:2])
+
+    code = " ".join(match.group(1).split())
+    before = cleaned[: match.start()].split()
+    after = cleaned[match.end() :].split()
+    brand = _brand_token(before) or _brand_token(after)
+    return " ".join(part for part in (brand, code) if part)
+
+
 def buy_url_for(product_name: str) -> str:
-    """Google Shopping AT. Název se jen zakóduje, cesta na webu výrobce se neskládá."""
-    name = " ".join(product_name.split())
-    return f"https://www.google.at/search?tbm=shop&q={quote_plus(name)}"
+    """Google Shopping AT: značka, modelové číslo a záporná slova proti náhradním dílům."""
+    focus = shopping_focus(product_name)
+    query = " ".join(part for part in (focus, *_SHOPPING_EXCLUDES) if part)
+    return f"https://www.google.at/search?tbm=shop&q={quote_plus(query)}"
 
 
 def marketplace_urls(original_title: str) -> dict[str, str]:
@@ -178,6 +260,14 @@ _SEARCH_HOSTS = {
     "bing.com",
     "search.yahoo.com",
 }
+
+
+def _direct_offer_or_empty(value: str) -> str:
+    """Přímá stránka nabídky zůstane. Vyhledávání na Google se neukládá."""
+    try:
+        return assert_direct_offer_url(value)
+    except ValueError:
+        return ""
 
 
 def assert_direct_offer_url(url: str) -> str:
@@ -268,13 +358,17 @@ class CandidateIdea(BaseModel):
 
     original_title: str = Field(
         description=(
-            "Přesný název výrobce a modelu, dohledatelný na webu výrobce nebo prodejce. "
-            "Nevymýšlej katalogová čísla ani neexistující řady."
+            "Přesný název výrobce a modelu, který se prodává v letech 2024–2026. "
+            "Model starší než 2022 a výběhový kus (Philips HD8651, Magnifica S, "
+            "Dedica EC685) neuváděj. Když dotaz žádá mlýnek, stroj bez mlýnku nepatří sem."
         )
     )
     estimated_price_eur: float = Field(
         gt=0,
-        description="Aktuální cena této konkrétní nabídky v EUR, z živého výsledku hledání.",
+        description=(
+            "Aktuální cena této konkrétní nabídky v EUR, opsaná z živého úryvku. "
+            "Číslo ze paměti je zakázané. Když úryvek cenu nemá, tento model neber."
+        ),
     )
     hard_fact: str = Field(
         description="Jeden měřitelný technický parametr, ne marketingová fráze."
@@ -395,16 +489,16 @@ class EvaluatedItem(BaseModel):
     )
     original_title: str = Field(
         description=(
-            "Přesný název výrobce a modelu, dohledatelný u prodejce. "
-            "Nevymýšlej artikl, u nejisté varianty uveď oficiální název řady."
+            "Výrobce a modelové číslo produktu, který se prodává v letech 2024–2026. "
+            "Model starší než 2022 a výběhový kus neuváděj. "
+            "Produkt musí splnit klíčová slova dotazu."
         )
     )
     estimated_price_eur: float = Field(
         gt=0,
         description=(
-            "Aktuální cena nalezené nabídky v EUR. "
-            "Když živý úryvek uvádí cenu, použij ji. Dopravné do AT připočti jen tehdy, "
-            "když je v podkladech uvedené zvlášť."
+            "Cena v EUR zkopírovaná ze stažené nabídky. "
+            "Číslo ze paměti modelu je zakázané."
         ),
     )
     pros: list[str] = Field(
@@ -450,15 +544,15 @@ class EvaluatedItem(BaseModel):
     url: str = Field(
         default="",
         description=(
-            "Nech prázdné. Nevymýšlej přímou URL výrobce ani katalogovou cestu. "
-            "Kód sem vloží Google Shopping AT podle přesného názvu produktu."
+            "Nech prázdné. Kód sem vloží přímý odkaz stažené nabídky. "
+            "Obecné vyhledávání na Google sem nepatří."
         ),
     )
     buy_url: str = Field(
         default="",
         description=(
-            "Nech prázdné. Kód doplní "
-            "https://www.google.at/search?tbm=shop&q= a přesný název produktu."
+            "Nech prázdné. Kód doplní přímý odkaz na stránku obchodu "
+            "ze stažených dat. Vyhledávací odkaz na Google sem nepatří."
         ),
     )
     geizhals_url: str = Field(
@@ -508,10 +602,11 @@ class EvaluatedItem(BaseModel):
         self.ship_from_country = country
         self.estimated_price_eur = round(float(self.estimated_price_eur), 2)
         self.willhaben_used_price_eur = round(float(self.willhaben_used_price_eur), 2)
-        # Model nesmí prosadit vymyšlenou cestu. Hlavní nákupní odkaz je vždy Google Shopping AT.
+        # Přímý odkaz nabídky se zachová. Obecné vyhledávání na Google se zahodí.
+        direct = _direct_offer_or_empty(self.buy_url) or _direct_offer_or_empty(self.url)
         links = marketplace_urls(title)
-        self.buy_url = buy_url_for(title)
-        self.url = self.buy_url
+        self.buy_url = direct
+        self.url = direct
         self.geizhals_url = links["geizhals_url"]
         self.idealo_url = links["idealo_url"]
         self.willhaben_url = links["willhaben_url"]
@@ -548,6 +643,82 @@ class FinalReport(BaseModel):
             )
         order = {badge: index for index, badge in enumerate(BADGE_ORDER)}
         self.items = sorted(self.items, key=lambda item: order[item.badge])
+        self.supervisor_verdict = _clean(self.supervisor_verdict)
+        if not self.supervisor_verdict:
+            raise ValueError("supervisor_verdict nesmí být prázdný.")
+        return self
+
+
+class OfferChoice(BaseModel):
+    """Jedna karta vybraná číslem ze staženého seznamu, bez ceny a bez odkazu."""
+
+    offer_id: int = Field(
+        ge=1,
+        le=40,
+        description="Číslo nabídky v hranatých závorkách. Jiný produkt je zakázaný.",
+    )
+    badge: Badge = Field(
+        description=(
+            "Přesně jedna kategorie: 'NEJLEVNĚJŠÍ FUNKČNÍ VOLBA', "
+            "'NEJLEPŠÍ CENA / VÝKON' nebo 'MODERNÍ TREND / INOVACE'."
+        )
+    )
+    name_cz: str = Field(
+        min_length=3,
+        description="Český název, který obsahuje značku a model z titulku vybrané nabídky.",
+    )
+    pros: list[str] = Field(
+        min_length=3,
+        max_length=3,
+        description="Přesně tři technické výhody. Bez ceny, bez EUR a bez marketingových klišé.",
+    )
+    cons: list[str] = Field(
+        min_length=2,
+        max_length=2,
+        description="Přesně dva kompromisy: chybějící funkce nebo provozní omezení.",
+    )
+    verdict_target: str = Field(description="Pro koho je nabídka a pro koho ne.")
+    willhaben_used_price_eur: float = Field(
+        gt=0,
+        description="Odhad ceny zachovalého kusu na Willhaben.at. Musí být nižší než cena nabídky.",
+    )
+    willhaben_liquidity: Liquidity = Field(description="Jak rychle se kus na Willhaben.at prodá.")
+
+    @model_validator(mode="after")
+    def normalize_choice(self) -> OfferChoice:
+        self.name_cz = _clean(self.name_cz)
+        self.verdict_target = _clean(self.verdict_target)
+        self.pros = [_clean(entry) for entry in self.pros]
+        self.cons = [_clean(entry) for entry in self.cons]
+        if not self.name_cz or not self.verdict_target or not all(self.pros) or not all(self.cons):
+            raise ValueError("Výběr musí mít název, výhody, kompromisy i pro koho je.")
+        self.willhaben_used_price_eur = round(float(self.willhaben_used_price_eur), 2)
+        return self
+
+
+class OfferShortlist(BaseModel):
+    """Tři vybraná čísla nabídek a rozbor k nim. Cenu ani odkaz model nevyplňuje."""
+
+    choices: list[OfferChoice] = Field(
+        min_length=3,
+        max_length=3,
+        description="Přesně tři různé nabídky ze staženého seznamu.",
+    )
+    supervisor_verdict: str = Field(
+        min_length=1,
+        max_length=600,
+        description="Jedna věcná věta: odkud nabídky jsou a jestli rozpočet vychází.",
+    )
+
+    @model_validator(mode="after")
+    def unique_picks(self) -> OfferShortlist:
+        if len({choice.offer_id for choice in self.choices}) != 3:
+            raise ValueError("Každá karta musí mít jiné číslo nabídky ze seznamu.")
+        found = {choice.badge for choice in self.choices}
+        if found != set(BADGE_ORDER):
+            raise ValueError(
+                "Výběr musí obsahovat každou kategorii právě jednou: " + ", ".join(BADGE_ORDER)
+            )
         self.supervisor_verdict = _clean(self.supervisor_verdict)
         if not self.supervisor_verdict:
             raise ValueError("supervisor_verdict nesmí být prázdný.")
