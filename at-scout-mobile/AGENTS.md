@@ -39,3 +39,11 @@ Docs: https://docs.expo.dev/eas/index.md
 - If `ios/` and `android/` directories do not exist, they are generated (Continuous Native Generation). Never create or edit them by hand — configure native behavior in `app.json` and config plugins.
 - Expo Go only includes its bundled native modules. After adding a library with native code, the app needs a development build: `npx expo run:ios|android` locally, or `eas build --profile development`.
 - Prefer recommended Expo modules over third-party libraries, and check your available skills before adding dependencies. Docs: https://docs.expo.dev/versions/latest/index.md
+
+## Cursor Cloud specific instructions
+
+- This folder is the Expo client. Install it with `npm ci` here, then run `npx expo start --web --host localhost --port 8082` and open `http://localhost:8082`. `--host localhost` listens on IPv6 `::1`, so use `localhost` rather than `127.0.0.1`.
+- The screen talks to the hosted scout API. Do not submit a search against that production URL while testing the client. Filling the product field and choosing a budget preset is enough to show the form works.
+- The API lives in the parent repository (`app.py`, `requirements.txt`, `_pipeline_check.py`). Create `.venv` with `python3 -m venv .venv` after `python3.12-venv` is installed, then `.venv/bin/pip install -r requirements.txt`.
+- `app.py` refuses to import unless `OPENAI_API_KEY` is set. The deterministic check does not call OpenAI: `OPENAI_API_KEY=local-dev .venv/bin/python _pipeline_check.py`.
+- A real `POST /api/scout` also needs `SERPER_API_KEY`. Without it the route returns HTTP 503 and does not invent prices. `TAVILY_API_KEY` is optional extra web search.
